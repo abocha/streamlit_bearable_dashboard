@@ -55,15 +55,21 @@ def estimate_cal(detail):
     return 0
 # === End Nutrition Helpers ===
 
-# === Core Load & Clean (Copied from previous version) ===
-@st.cache_data # Add caching for performance
-def load_and_clean(csv_file: Path | str) -> pd.DataFrame:
-    """Loads, cleans, and pivots Bearable export data."""
-    try:
-        df = pd.read_csv(csv_file)
-    except Exception as e:
-        st.error(f"Error reading CSV: {e}")
-        return pd.DataFrame()
+# === Core Load & Clean (MODIFIED: Accepts DataFrame) ===
+@st.cache_data # Caching should still work based on DataFrame content
+def load_and_clean(input_df: pd.DataFrame) -> pd.DataFrame: # Changed input type
+    """Cleans and pivots data from an already loaded Bearable DataFrame."""
+    # REMOVED: pd.read_csv call is GONE from here
+
+    # Start processing directly from the input DataFrame
+    # Make a copy to avoid modifying the original df_raw_unprocessed
+    df = input_df.copy()
+
+    # --- Rest of the function remains the same ---
+    # Ensure required columns are present from the input DataFrame
+    if "date formatted" not in df.columns or "rating/amount" not in df.columns:
+         st.error("Input DataFrame is missing required columns ('date formatted', 'rating/amount').")
+         return pd.DataFrame()
 
     df.columns = [c.strip().replace('"', "") for c in df.columns]
     df["date"] = pd.to_datetime(df["date formatted"], errors="coerce")
@@ -75,7 +81,11 @@ def load_and_clean(csv_file: Path | str) -> pd.DataFrame:
         cal = pd.DataFrame(index=unique_dates)
         cal.index.name = "date"
     else:
+        st.warning("No valid dates found after initial cleaning.")
         return pd.DataFrame()
+
+    # ... (rest of the helpers, category processing, symptoms, cleanup) ...
+    # ... (No changes needed in the internal logic below this point) ...
 
     energy_map = {"v. low": 1, "low": 2, "ok": 3, "high": 4, "v. high": 5}
     qual_map = {"poor": 1, "ok": 2, "good": 3, "great": 4}
@@ -106,44 +116,65 @@ def load_and_clean(csv_file: Path | str) -> pd.DataFrame:
         ("Energy", lambda df_cat: df_cat.assign(val=df_cat.detail.str.lower().map(energy_map).fillna(df_cat["rating"])).groupby(df_cat["date"].dt.date)["val"].mean().rename("average_energy")),
         ("Sleep quality", lambda df_cat: df_cat.assign(qnum=df_cat["rating"].fillna(df_cat.detail.str.lower().map(qual_map))).groupby(df_cat["date"].dt.date)["qnum"].mean().rename("sleep_quality_score"))
     ]:
-        cat_df = df[df.category == category].dropna(subset=["rating"])
-        if not cat_df.empty:
-            cal = cal.join(process_func(cat_df))
+         # Check if category exists before processing
+        if category in df['category'].unique():
+            cat_df = df[df.category == category].dropna(subset=["rating"]) # Original df has rating column
+            if not cat_df.empty:
+                cal = cal.join(process_func(cat_df))
+        else:
+             # Initialize column if category is missing but expected later
+             if category == "Mood": cal['average_mood'] = np.nan
+             if category == "Energy": cal['average_energy'] = np.nan
+             if category == "Sleep quality": cal['sleep_quality_score'] = np.nan
+
 
     # Sleep duration and bedtime
-    sl_df = df[df.category == 'Sleep'].copy()
-    if not sl_df.empty:
-        sl_df['hours_num'] = sl_df['rating'].apply(hhmm_to_hours)
-        sleep_details = sl_df['detail'].apply(asleep_hours).apply(pd.Series)
-        sleep_details.columns = ['hours_det', 'bed_hour']
-        sl_df = pd.concat([sl_df, sleep_details], axis=1)
-        sl_df['sleep_duration_hours'] = sl_df['hours_num'].fillna(sl_df['hours_det'])
-        sl_df['late_bedtime_flag'] = (sl_df['bed_hour'] > 1).astype(int)
-        sleep_agg = sl_df.groupby(sl_df['date'].dt.date).agg(
-            sleep_duration_hours=('sleep_duration_hours', 'first'),
-            late_bedtime_flag=('late_bedtime_flag', 'max'),
-            bed_hour=('bed_hour', 'first')
-        )
-        cal = cal.join(sleep_agg)
+    if 'Sleep' in df['category'].unique():
+        sl_df = df[df.category == 'Sleep'].copy()
+        if not sl_df.empty:
+            sl_df['hours_num'] = sl_df['rating'].apply(hhmm_to_hours)
+            sleep_details = sl_df['detail'].apply(asleep_hours).apply(pd.Series)
+            sleep_details.columns = ['hours_det', 'bed_hour']
+            sl_df = pd.concat([sl_df, sleep_details], axis=1)
+            sl_df['sleep_duration_hours'] = sl_df['hours_num'].fillna(sl_df['hours_det'])
+            sl_df['late_bedtime_flag'] = (sl_df['bed_hour'] > 1).astype(int)
+            sleep_agg = sl_df.groupby(sl_df['date'].dt.date).agg(
+                sleep_duration_hours=('sleep_duration_hours', 'first'),
+                late_bedtime_flag=('late_bedtime_flag', 'max'),
+                bed_hour=('bed_hour', 'first')
+            )
+            cal = cal.join(sleep_agg)
+    else:
+        # Initialize columns if Sleep category missing
+        cal['sleep_duration_hours'] = np.nan
+        cal['late_bedtime_flag'] = np.nan
+        cal['bed_hour'] = np.nan
+
 
     # Symptoms
-    sym_df = df[df.category == "Symptom"].copy()
-    if not sym_df.empty:
-        sym_df["name"] = sym_df.detail.str.replace(
-            r"\s*\((?:Mild|Moderate|Severe|Unbearable|Extreme)\)", "", regex=True
-        ).str.strip()
-        sym_df["sev"] = pd.to_numeric(sym_df["rating"], errors='coerce').astype("Int64").clip(1, 4)
-        piv = sym_df.groupby([sym_df["date"].dt.date, "name"])["sev"].max().unstack()
-        cal = cal.join(piv)
-        if not piv.empty:
-             cal["TotalSymptomScore"] = piv.fillna(0).sum(axis=1)
+    if 'Symptom' in df['category'].unique():
+        sym_df = df[df.category == "Symptom"].copy()
+        if not sym_df.empty:
+            sym_df["name"] = sym_df.detail.str.replace(
+                r"\s*\((?:Mild|Moderate|Severe|Unbearable|Extreme)\)", "", regex=True
+            ).str.strip()
+            sym_df["sev"] = pd.to_numeric(sym_df["rating"], errors='coerce').astype("Int64").clip(1, 4)
+            piv = sym_df.groupby([sym_df["date"].dt.date, "name"])["sev"].max().unstack()
+            cal = cal.join(piv) # Join pivoted symptoms
+            if not piv.empty:
+                 cal["TotalSymptomScore"] = piv.fillna(0).sum(axis=1)
+            else:
+                 cal["TotalSymptomScore"] = 0
         else:
-             cal["TotalSymptomScore"] = 0
+             cal["TotalSymptomScore"] = 0 # No symptoms logged
+    else:
+        cal["TotalSymptomScore"] = 0 # No symptom category
 
     # Final cleanup
-    cal = cal.astype(float)
-    cal = cal.loc[:, cal.notna().sum() >= 3]
+    cal = cal.astype(float) # Convert relevant columns to float
+    cal = cal.loc[:, cal.notna().sum() >= 3] # Keep columns with sufficient data
     return cal.sort_index()
+
 # === End Load & Clean ===
 
 
@@ -187,7 +218,7 @@ key_symptom_use_std = st.sidebar.checkbox(
 )
 
 # ───────────────────────────────────────────────
-# 3. Load CSV (Adapted logic from previous version)
+# 3. Load CSV (MODIFIED: Read Once)
 # ───────────────────────────────────────────────
 st.title("🐰 Bearable Mood & Symptom Dashboard")
 st.markdown("Focusing on mood, energy, sleep, nutrition, and key symptom patterns.")
@@ -198,6 +229,7 @@ pattern = re.compile(
 )
 latest_file = None
 source_info = None
+source_object = None # Will hold Path or UploadedFile
 
 if EXPORT_DIR.exists() and EXPORT_DIR.is_dir():
     matches = []
@@ -210,30 +242,47 @@ if EXPORT_DIR.exists() and EXPORT_DIR.is_dir():
             except ValueError: continue
     if matches:
         latest_file = sorted(matches, key=lambda x: x[0], reverse=True)[0][1]
-        source_info = latest_file
+        source_info = latest_file.name
+        source_object = latest_file # Use Path object
 
+# Determine source
 if latest_file:
-    st.success(f"Auto‑loaded: {latest_file.name}")
-    source = latest_file
+    st.success(f"Auto‑loaded: {source_info}")
 else:
     st.sidebar.info("Auto-load failed or no files found.")
-    source = st.sidebar.file_uploader("Upload Bearable CSV", type="csv", key="manual_upload")
-    if source:
-        source_info = source.name
+    uploaded_file = st.sidebar.file_uploader("Upload Bearable CSV", type="csv", key="manual_upload")
+    if uploaded_file:
+        source_info = uploaded_file.name
+        source_object = uploaded_file # Use UploadedFile object
     else:
         st.warning("No auto‑load file found – please upload manually via the sidebar ⬆️")
         st.stop()
 
+# --- Read data ONCE ---
 try:
-    df_raw_unprocessed = pd.read_csv(source)
-    df_cleaned = load_and_clean(source)
+    # Read the source (Path or UploadedFile) into the raw DataFrame
+    df_raw_unprocessed = pd.read_csv(source_object)
+
+    # --- Pass the DataFrame to load_and_clean ---
+    df_cleaned = load_and_clean(df_raw_unprocessed)
+
 except Exception as e:
-    st.error(f"Failed to load or process data from {source_info or 'source'}: {e}")
+    st.error(f"Failed to load or process data from {source_info}: {e}")
+    # Add more specific error info if possible
+    if isinstance(e, pd.errors.EmptyDataError):
+        st.error("The CSV file appears to be empty.")
+    elif isinstance(e, UnicodeDecodeError):
+         st.error("Could not decode the file. Check if it's a valid UTF-8 CSV.")
     st.stop()
 
+# --- Check if cleaning was successful ---
 if df_cleaned.empty:
-    st.error(f"No processable data found in {source_info or 'source'}. Check file format.")
+    st.error(f"No processable data found after cleaning {source_info}. Potential issues: incorrect format, missing essential columns ('date formatted', 'rating/amount'), or insufficient data per column.")
     st.stop()
+
+# --- df_raw_unprocessed is still available for nutrition processing later ---
+# --- df_cleaned holds the result for feature engineering ---
+
 
 # ───────────────────────────────────────────────
 # 4. Feature engineering & flags (No Dynamic Clustering)
