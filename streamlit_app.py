@@ -9,6 +9,30 @@ from scipy.cluster.hierarchy import linkage, fcluster
 import seaborn as sns
 import matplotlib.pyplot as plt
 import altair as alt
+import re
+
+# ── Nutrition parsing helpers ─────────────────────────────────────
+def parse_amount(detail):
+    m = re.search(r'Amount eaten\s*-\s*(\w+)', str(detail))
+    return {'Little':1, 'Moderate':2, 'A lot':3}.get(m.group(1), np.nan) if m else np.nan
+
+def count_meals(detail):
+    s = str(detail)
+    return len([i for i in s.replace('Meals:','').split('|') if i.strip()]) if s.startswith('Meals:') else 0
+
+# Calorie estimates (extend as needed)
+CAL_MAP = {
+    'Coffee':5, 'Instant noodles':400, 'Shawarma':600, 'Banana':100, 'Yogurt':150,
+    'Banana and yogurt':250, 'Chicken':200, 'Chicken and rice':500, 'Chicken Salad':300,
+    'Bánh Mì':550, 'Burrito':500, 'Chips':150, 'Chocolate':200, 'Chocopie':100,
+    'Coke':140, 'Egg and sausage':250, 'KFC':800, 'Nuts':200, 'Oreo':50,
+    'Pizza':300, 'Smoothie':200, 'Snickers':250, 'Waffle':250
+}
+
+def estimate_cal(detail):
+    if str(detail).startswith('Meals:'):
+        return sum(CAL_MAP.get(f.strip(), 0) for f in detail.replace('Meals:','').split('|'))
+    return 0
 
 # ───────────────────────────────────────────────
 # 0. Page config
@@ -186,6 +210,43 @@ df_feat['sleep_std_7d'] = (
     df_feat['sleep_duration_hours'].rolling(7, min_periods=1).std()
 )
 
+# ── Nutrition features & flags ────────────────────────────────────
+# Use the same `latest_file` you loaded above for raw data
+raw_nut = pd.read_csv(latest_file)
+raw_nut['date'] = pd.to_datetime(raw_nut['date formatted'], errors='coerce').dt.date
+
+nut_df = raw_nut[raw_nut['category']=='Nutrition'].copy()
+# parse
+nut_df['nutrition_amount']    = nut_df['detail'].map(parse_amount)
+nut_df['nutrition_num_items'] = nut_df['detail'].map(count_meals)
+# aggregate
+agg = nut_df.groupby('date').agg({
+    'nutrition_amount':'max',
+    'nutrition_num_items':'sum'
+})
+df_feat = df_feat.join(agg, how='left').fillna({
+    'nutrition_amount':0,
+    'nutrition_num_items':0
+})
+
+# calories
+nut_df['calories'] = nut_df['detail'].map(estimate_cal)
+cal_agg = nut_df.groupby('date')['calories'].sum()
+df_feat['daily_calories'] = cal_agg.reindex(df_feat.index, fill_value=0)
+
+# evening items
+pm_df = nut_df[nut_df['time of day']=='pm'].copy()
+pm_df['pm_items'] = pm_df['detail'].map(count_meals)
+evening_agg = pm_df.groupby('date')['pm_items'].sum()
+df_feat['evening_num_items'] = evening_agg.reindex(df_feat.index, fill_value=0)
+
+# now flags
+median_cal = df_feat['daily_calories'].median()
+df_feat['flag_low_cal']     = (df_feat['daily_calories'] < median_cal).astype(int)
+df_feat['flag_few_items']   = (df_feat['nutrition_num_items'] < 3).astype(int)
+df_feat['flag_no_pm_snack'] = (df_feat['evening_num_items'] == 0).astype(int)
+
+
 # Sidebar slider for variability threshold
 var_thr = st.sidebar.slider(
     "Sleep‑variability flag (7‑day SD > … hours)",
@@ -217,41 +278,46 @@ df_feat["flag_cluster3"] = (df_feat["cluster3_sum"] > thr3).astype(int)
 df_feat["flag_low_energy"] = (df_feat["average_energy"] < energy_thr).astype(int)
 
 # ───────────────────────────────────────────────
+# 4b. Nutrition‐based flags
+# ───────────────────────────────────────────────
+
+# Compute your personal median calories
+median_cal = df_feat["daily_calories"].median()
+
+# Flag “low fuel” days
+df_feat["flag_low_cal"] = (df_feat["daily_calories"] < median_cal).astype(int)
+
+# Flag “too few items” days
+df_feat["flag_few_items"] = (df_feat["nutrition_num_items"] < 3).astype(int)
+
+# Flag “no evening snack” days
+df_feat["flag_no_pm_snack"] = (df_feat["evening_num_items"] == 0).astype(int)
+
+
+# ───────────────────────────────────────────────
 # 5. Today’s alerts
 # ───────────────────────────────────────────────
 today = pd.to_datetime(date.today())
 st.subheader(f"🚨 Alerts for {today.date()}")
 
+labels_and_flags = [
+    ("🔋 Low Energy",       "flag_low_energy"),
+    ("💤 Short Sleep (t−2)", "flag_sleep_predict"),
+    ("📈 Sleep Variability","flag_sleep_var"),
+    ("⚠️ Cluster 3 spike",  "flag_cluster3"),
+    ("🍽️ Low Calories",     "flag_low_cal"),
+    ("🥄 Few Items",        "flag_few_items"),
+    ("🌙 No PM Snack",      "flag_no_pm_snack"),
+]
+
 if today in df_feat.index:
-    # switch from 3 to 4 columns
-    colA, colB, colC, colD = st.columns(4)
-
-    with colA:
-        st.metric(
-            "🔋 Low Energy < threshold",
-            bool(df_feat.loc[today, "flag_low_energy"])
-        )
-
-    with colB:
-        st.metric(
-            "💤 Sleep < threshold (t−2)",
-            bool(df_feat.loc[today, "flag_sleep_predict"])
-        )
-
-    with colC:
-        st.metric(
-            "📈 Sleep variability ↑",
-            bool(df_feat.loc[today, "flag_sleep_var"])
-        )
-
-    with colD:
-        st.metric(
-            "⚠️ Cluster 3 spike",
-            bool(df_feat.loc[today, "flag_cluster3"])
-        )
-
+    cols = st.columns(len(labels_and_flags))
+    for col, (label, flag) in zip(cols, labels_and_flags):
+        with col:
+            st.metric(label, bool(df_feat.loc[today, flag]))
 else:
     st.info("No data for today in this export.")
+
 
 
 # ───────────────────────────────────────────────
@@ -299,11 +365,21 @@ flag_colors = {
     "flag_sleep_var": "#277da1",      # blue
     "flag_cluster3": "#9c89b8",       # purple
 }
+# Add your nutrition flags to the color map
+flag_colors.update({
+    "flag_low_cal":    "#90be6d",  # green
+    "flag_few_items":  "#43aa8b",  # teal
+    "flag_no_pm_snack":"#577590",  # slate
+})
 
 # 2. Melt your flags into “long” form
+# When you do the melt, include the new flags:
 flags_long = (
-    df_feat[["flag_low_energy","flag_sleep_predict","flag_sleep_var","flag_cluster3"]]
-    .reset_index()  # brings the date index into a column named “date”
+    df_feat[
+      ["flag_low_energy","flag_sleep_predict","flag_sleep_var",
+       "flag_cluster3","flag_low_cal","flag_few_items","flag_no_pm_snack"]
+    ]
+    .reset_index()
     .melt(id_vars="date", var_name="flag", value_name="value")
 )
 
@@ -348,6 +424,14 @@ with st.expander("❓ What do the alerts mean?", expanded=False):
             st.markdown(f"**{title}**")
             st.write(text)
 
+with st.expander("🍽 What do the nutrition alerts mean?", expanded=False):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("**⛽ Low Fuel**  \nCalories below your personal median → expect flatter mood/energy.")
+    with c2:
+        st.markdown("**🍽 Few Items**  \nFewer than 3 log‑entries → consider adding a snack or small meal.")
+    with c3:
+        st.markdown("**🌙 No PM Snack**  \nNo evening intake → a small bedtime snack can help round out your day’s energy.")
 
 
 with st.expander("🧠 What is Cluster 3? (ADHD / Depression Symptom Group)", expanded=False):
