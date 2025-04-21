@@ -5,30 +5,78 @@ import numpy as np
 import re
 from pathlib import Path
 from datetime import timedelta, date
-from scipy.cluster.hierarchy import linkage, fcluster
+# Removed: from scipy.cluster.hierarchy import linkage, fcluster
 import seaborn as sns
 import matplotlib.pyplot as plt
 import altair as alt
 
 # ───────────────────────────────────────────────
-# 0. Page config
+# 0. Page config & Constants
 # ───────────────────────────────────────────────
-st.set_page_config(page_title="Bearable Dashboard", layout="wide")
+st.set_page_config(page_title="Bearable Mood & Symptom Dashboard", layout="wide")
+
+# --- Define the Key Symptom List (Derived from 60-day analysis) ---
+# These symptoms, as a group, showed the strongest correlation with low mood.
+FINAL_KEY_SYMPTOM_COLS = [
+    "Depression", "Fidgeting", "Forgetfulness", "Hyperfocused on the RIGHT thing",
+    "Impulsivity", "Irritability", "Mental Restlessness", "Mood swings",
+    "Pessimism", "Physical restlessness", "Racing thoughts", "Random energy spike",
+    "Seeking stimulation", "Shutdown mode", "Sudden energy drop"
+]
 
 # ───────────────────────────────────────────────
 # 1. Utility: scrub & feature engineer
 # ───────────────────────────────────────────────
+
+# === Nutrition Helpers (Copied from previous version) ===
+def parse_amount(detail):
+    m = re.search(r'Amount eaten\s*[-–]\s*(\w+)', str(detail))
+    return {'Little':1, 'Moderate':2, 'A lot':3}.get(m.group(1), np.nan) if m else np.nan
+
+def count_meals(detail):
+    s = str(detail)
+    if s.startswith('Meals:'):
+        return sum(1 for part in s.replace('Meals:','', 1).split('|') if part.strip())
+    return 0
+
+CAL_MAP = {
+    'Coffee':5, 'Instant noodles':400, 'Shawarma':600, 'Banana':100, 'Yogurt':150,
+    'Banana and yogurt':250, 'Chicken':200, 'Chicken and rice':500,
+    'Chicken Salad':300, 'Bánh Mì':550, 'Burrito':500, 'Chips':150,
+    'Chocolate':200, 'Chocopie':100, 'Coke':140, 'Egg and sausage':250,
+    'KFC':800, 'Nuts':200, 'Oreo':50, 'Pizza':300, 'Smoothie':200,
+    'Snickers':250, 'Waffle':250
+}
+
+def estimate_cal(detail):
+    s = str(detail)
+    if s.startswith('Meals:'):
+        return sum(CAL_MAP.get(item.strip(), 0) for item in s.replace('Meals:','', 1).split('|') if item.strip())
+    return 0
+# === End Nutrition Helpers ===
+
+# === Core Load & Clean (Copied from previous version) ===
+@st.cache_data # Add caching for performance
 def load_and_clean(csv_file: Path | str) -> pd.DataFrame:
-    df = pd.read_csv(csv_file)
+    """Loads, cleans, and pivots Bearable export data."""
+    try:
+        df = pd.read_csv(csv_file)
+    except Exception as e:
+        st.error(f"Error reading CSV: {e}")
+        return pd.DataFrame()
+
     df.columns = [c.strip().replace('"', "") for c in df.columns]
     df["date"] = pd.to_datetime(df["date formatted"], errors="coerce")
     df["rating"] = pd.to_numeric(df["rating/amount"], errors="coerce")
     df = df.dropna(subset=["date"])
 
-    cal = pd.DataFrame(index=pd.to_datetime(df["date"].dt.date.unique()))
-    cal.index.name = "date"
+    unique_dates = pd.to_datetime(df["date"].dt.date.unique())
+    if not unique_dates.empty:
+        cal = pd.DataFrame(index=unique_dates)
+        cal.index.name = "date"
+    else:
+        return pd.DataFrame()
 
-    # helpers
     energy_map = {"v. low": 1, "low": 2, "ok": 3, "high": 4, "v. high": 5}
     qual_map = {"poor": 1, "ok": 2, "good": 3, "great": 4}
     sleep_pat = re.compile(
@@ -36,223 +84,283 @@ def load_and_clean(csv_file: Path | str) -> pd.DataFrame:
     )
 
     def hhmm_to_hours(s):
-        if pd.isna(s):
-            return np.nan
+        if pd.isna(s): return np.nan
         m = re.match(r"^(\d{1,2}):(\d{2})$", str(s).strip())
         return np.nan if not m else int(m[1]) + int(m[2]) / 60
 
     def asleep_hours(detail):
-        if pd.isna(detail):
-            return (np.nan, np.nan)
-        m = sleep_pat.search(detail)
-        if not m:
-            return (np.nan, np.nan)
+        if pd.isna(detail): return (np.nan, np.nan)
+        m = sleep_pat.search(str(detail))
+        if not m: return (np.nan, np.nan)
         h1, m1, h2, m2 = map(int, m.groups())
         start = timedelta(hours=h1, minutes=m1)
         end = timedelta(hours=h2, minutes=m2)
-        if end < start:
-            end += timedelta(days=1)
-        return ((end - start).total_seconds() / 3600, h1)
+        if end < start: end += timedelta(days=1)
+        duration = (end - start).total_seconds() / 3600
+        bed_hour = h1
+        return (duration, bed_hour)
 
-    # mood
-    mood = (
-        df[df.category == "Mood"]
-        .dropna(subset=["rating"])
-        .groupby(df["date"].dt.date)["rating"]
-        .mean()
-        .rename("average_mood")
-    )
-    cal = cal.join(mood)
+    # Process categories
+    for category, process_func in [
+        ("Mood", lambda df_cat: df_cat.groupby(df_cat["date"].dt.date)["rating"].mean().rename("average_mood")),
+        ("Energy", lambda df_cat: df_cat.assign(val=df_cat.detail.str.lower().map(energy_map).fillna(df_cat["rating"])).groupby(df_cat["date"].dt.date)["val"].mean().rename("average_energy")),
+        ("Sleep quality", lambda df_cat: df_cat.assign(qnum=df_cat["rating"].fillna(df_cat.detail.str.lower().map(qual_map))).groupby(df_cat["date"].dt.date)["qnum"].mean().rename("sleep_quality_score"))
+    ]:
+        cat_df = df[df.category == category].dropna(subset=["rating"])
+        if not cat_df.empty:
+            cal = cal.join(process_func(cat_df))
 
-    # energy
-    en = df[df.category == "Energy"].copy()
-    if not en.empty:
-        en["val"] = en.detail.str.lower().map(energy_map).fillna(en["rating"])
-        cal = cal.join(
-            en.groupby(en["date"].dt.date)["val"].mean().rename("average_energy")
+    # Sleep duration and bedtime
+    sl_df = df[df.category == 'Sleep'].copy()
+    if not sl_df.empty:
+        sl_df['hours_num'] = sl_df['rating'].apply(hhmm_to_hours)
+        sleep_details = sl_df['detail'].apply(asleep_hours).apply(pd.Series)
+        sleep_details.columns = ['hours_det', 'bed_hour']
+        sl_df = pd.concat([sl_df, sleep_details], axis=1)
+        sl_df['sleep_duration_hours'] = sl_df['hours_num'].fillna(sl_df['hours_det'])
+        sl_df['late_bedtime_flag'] = (sl_df['bed_hour'] > 1).astype(int)
+        sleep_agg = sl_df.groupby(sl_df['date'].dt.date).agg(
+            sleep_duration_hours=('sleep_duration_hours', 'first'),
+            late_bedtime_flag=('late_bedtime_flag', 'max'),
+            bed_hour=('bed_hour', 'first')
         )
+        cal = cal.join(sleep_agg)
 
-    # ── SLEEP ─────────────────────────────────────────────────────────
-    sl = df[df.category == 'Sleep'].copy()
-    if not sl.empty:
-        sl['hours_num'] = sl['rating'].apply(hhmm_to_hours)
-        sl[['hours_det', 'bed_hour']] = (                    # <- keep bed_hour
-            sl['detail'].apply(asleep_hours).apply(pd.Series)
-        )
-        sl['sleep_duration_hours'] = sl['hours_num'].fillna(sl['hours_det'])
-        sl['late_bedtime_flag']    = (sl['bed_hour'] > 1).astype(int)
-
-        cal = (
-            cal
-            .join(                                             # sleep duration
-                sl.groupby(sl['date'].dt.date)['sleep_duration_hours']
-                  .first().rename('sleep_duration_hours')
-            )
-            .join(                                             # existing flag
-                sl.groupby(sl['date'].dt.date)['late_bedtime_flag']
-                  .max().rename('late_bedtime_flag')
-            )
-            .join(                                             # **NEW → keeps raw bedtime**
-                sl.groupby(sl['date'].dt.date)['bed_hour']
-                  .first().rename('bed_hour')
-            )
-        )
-
-
-    # sleep quality
-    sq = df[df.category == "Sleep quality"].copy()
-    if not sq.empty:
-        sq["qnum"] = sq["rating"].fillna(sq.detail.str.lower().map(qual_map))
-        cal = cal.join(
-            sq.groupby(sq["date"].dt.date)["qnum"].mean().rename("sleep_quality_score")
-        )
-
-    # symptoms
-    sym = df[df.category == "Symptom"].copy()
-    if not sym.empty:
-        sym["name"] = sym.detail.str.replace(
+    # Symptoms
+    sym_df = df[df.category == "Symptom"].copy()
+    if not sym_df.empty:
+        sym_df["name"] = sym_df.detail.str.replace(
             r"\s*\((?:Mild|Moderate|Severe|Unbearable|Extreme)\)", "", regex=True
         ).str.strip()
-        sym["sev"] = sym["rating"].astype("Int64").clip(1, 4)
-        piv = sym.groupby([sym["date"].dt.date, "name"])["sev"].max().unstack()
+        sym_df["sev"] = pd.to_numeric(sym_df["rating"], errors='coerce').astype("Int64").clip(1, 4)
+        piv = sym_df.groupby([sym_df["date"].dt.date, "name"])["sev"].max().unstack()
         cal = cal.join(piv)
-        cal["TotalSymptomScore"] = piv.fillna(0).sum(axis=1)
+        if not piv.empty:
+             cal["TotalSymptomScore"] = piv.fillna(0).sum(axis=1)
+        else:
+             cal["TotalSymptomScore"] = 0
 
+    # Final cleanup
     cal = cal.astype(float)
     cal = cal.loc[:, cal.notna().sum() >= 3]
     return cal.sort_index()
+# === End Load & Clean ===
 
 
+# === Feature Adder (No Clustering Here) ===
+@st.cache_data
 def add_features(df: pd.DataFrame, sleep_thr: float) -> pd.DataFrame:
+    """Adds rolling averages, flags, and other derived features."""
+    if df.empty: return df
     df2 = df.copy()
+    for col in ['average_mood', 'sleep_duration_hours']:
+        if col not in df2.columns: df2[col] = np.nan
+
     df2["mood_7d_ma"] = df2["average_mood"].rolling(7, min_periods=1).mean()
     df2["mood_delta"] = df2["average_mood"] - df2["mood_7d_ma"]
-    df2["is_weekend"] = (
-        df2.index.to_series().dt.weekday.isin([5, 0]).astype(int)
-    )  # Sat & Mon
+    df2["is_weekend"] = (df2.index.to_series().dt.weekday.isin([5, 6])).astype(int)
 
-    # rule: short sleep flag shifted +2 days
-    df2["flag_sleep_predict"] = (
-        (df2["sleep_duration_hours"] < sleep_thr).shift(2).fillna(False).astype(int)
-    )
+    if 'sleep_duration_hours' in df2.columns:
+        df2["flag_sleep_predict"] = (
+            (df2["sleep_duration_hours"] < sleep_thr).shift(2).fillna(False).astype(int)
+        )
+    else:
+         df2["flag_sleep_predict"] = 0
     return df2
+# === End Feature Adder ===
 
 
 # ───────────────────────────────────────────────
 # 2. Sidebar controls
 # ───────────────────────────────────────────────
 st.sidebar.header("⚙️ Alert Thresholds")
-energy_thr = st.sidebar.slider("Energy < threshold triggers flag", 1.0, 5.0, 3.0, 0.5)
-sleep_thr = st.sidebar.slider("Sleep hours threshold (<) for 2‑day mood dip", 4.0, 8.0, 6.0, 0.5)
-cluster3_std = st.sidebar.checkbox("Cluster 3 flag uses median + 1 SD", value=False)
+energy_thr = st.sidebar.slider("Energy < threshold triggers flag", 1.0, 5.0, 3.0, 0.5, key="energy_thr_slider")
+sleep_thr = st.sidebar.slider("Sleep hours threshold (<) for t+2 mood dip", 4.0, 8.0, 6.0, 0.5, key="sleep_thr_slider")
+var_thr = st.sidebar.slider(
+    "Sleep variability flag (7‑day SD > … hours)", 0.0, 3.0, 1.0, 0.1, key="var_thr_slider"
+)
+# Renamed checkbox for clarity: Controls threshold for Key Symptom Score flag
+key_symptom_use_std = st.sidebar.checkbox(
+    "Flag Key Symptoms using median + 1 SD (else median)",
+    value=True, # Default to using STD as per original Cluster 3 logic
+    key="key_symptom_std_check"
+)
 
 # ───────────────────────────────────────────────
-# 3. Auto‑load latest CSV from Google Drive
+# 3. Load CSV (Adapted logic from previous version)
 # ───────────────────────────────────────────────
-st.title("🐰 Bearable Dashboard & Early‑Warning Flags")
+st.title("🐰 Bearable Mood & Symptom Dashboard")
+st.markdown("Focusing on mood, energy, sleep, nutrition, and key symptom patterns.")
 
-EXPORT_DIR = Path("G:/Мой диск/Bearable_export")
+EXPORT_DIR = Path("G:/Мой диск/Bearable_export") # Adjust if your path is different
 pattern = re.compile(
     r"Bearable App - Data Export\. Generated (\d{2}-\d{2}-\d{4})\.csv"
 )
 latest_file = None
-if EXPORT_DIR.exists():
+source_info = None
+
+if EXPORT_DIR.exists() and EXPORT_DIR.is_dir():
     matches = []
     for file in EXPORT_DIR.glob("*.csv"):
         m = pattern.match(file.name)
         if m:
-            dt = pd.to_datetime(m.group(1), format="%d-%m-%Y", errors="coerce")
-            if pd.notna(dt):
-                matches.append((dt, file))
+            try:
+                dt = pd.to_datetime(m.group(1), format="%d-%m-%Y", errors='coerce')
+                if pd.notna(dt): matches.append((dt, file))
+            except ValueError: continue
     if matches:
-        latest_file = sorted(matches, reverse=True)[0][1]
+        latest_file = sorted(matches, key=lambda x: x[0], reverse=True)[0][1]
+        source_info = latest_file
 
 if latest_file:
     st.success(f"Auto‑loaded: {latest_file.name}")
-    df_raw = load_and_clean(latest_file)
+    source = latest_file
 else:
-    st.warning("No auto‑load file found – upload manually ⬇")
-    uploaded = st.file_uploader("Upload Bearable CSV", type="csv")
-    if not uploaded:
+    st.sidebar.info("Auto-load failed or no files found.")
+    source = st.sidebar.file_uploader("Upload Bearable CSV", type="csv", key="manual_upload")
+    if source:
+        source_info = source.name
+    else:
+        st.warning("No auto‑load file found – please upload manually via the sidebar ⬆️")
         st.stop()
-    df_raw = load_and_clean(uploaded)
+
+try:
+    df_raw_unprocessed = pd.read_csv(source)
+    df_cleaned = load_and_clean(source)
+except Exception as e:
+    st.error(f"Failed to load or process data from {source_info or 'source'}: {e}")
+    st.stop()
+
+if df_cleaned.empty:
+    st.error(f"No processable data found in {source_info or 'source'}. Check file format.")
+    st.stop()
 
 # ───────────────────────────────────────────────
-# 4. Feature engineering & flags
+# 4. Feature engineering & flags (No Dynamic Clustering)
 # ───────────────────────────────────────────────
-df_feat = add_features(df_raw, sleep_thr)
-# 7‑day rolling standard‑deviation of sleep hours
-df_feat['sleep_std_7d'] = (
-    df_feat['sleep_duration_hours'].rolling(7, min_periods=1).std()
-)
 
-# Sidebar slider for variability threshold
-var_thr = st.sidebar.slider(
-    "Sleep‑variability flag (7‑day SD > … hours)",
-    0.0, 3.0, 1.0, 0.1
-)
+# --- Core Features ---
+df_feat = add_features(df_cleaned, sleep_thr)
 
-df_feat['flag_sleep_var'] = (df_feat['sleep_std_7d'] > var_thr).astype(int)
+# Sleep Variability Flag
+if 'sleep_duration_hours' in df_feat.columns:
+    df_feat['sleep_std_7d'] = df_feat['sleep_duration_hours'].rolling(7, min_periods=1).std().fillna(0)
+    df_feat['flag_sleep_var'] = (df_feat['sleep_std_7d'] > var_thr).astype(int)
+else:
+    df_feat['sleep_std_7d'] = 0
+    df_feat['flag_sleep_var'] = 0
 
-# cluster 3 creation
-exclude_cols = {
-    "average_mood", "average_energy", "sleep_duration_hours", "late_bedtime_flag",
-    "sleep_quality_score", "mood_7d_ma", "mood_delta", "is_weekend",
-    "flag_sleep_predict", "flag_low_energy", "flag_cluster3", "flag_sleep_var",
-    "sleep_std_7d", "cluster3_sum", "bed_hour"  # ← make sure this is in the list
-}
-symptom_cols = [
-    col for col in df_feat.columns
-    if col not in exclude_cols and df_feat[col].dtype == float
-]
-Z = linkage(df_feat[symptom_cols].T.fillna(0), method="ward", metric="euclidean")
-cluster_ids = fcluster(Z, 4, criterion="maxclust")
-cluster3_cols = [symptom_cols[i] for i, cid in enumerate(cluster_ids) if cid == 3]
+# Energy Flag
+if 'average_energy' in df_feat.columns:
+    df_feat["flag_low_energy"] = (df_feat["average_energy"] < energy_thr).astype(int)
+else:
+    df_feat["flag_low_energy"] = 0
 
-df_feat["cluster3_sum"] = df_feat[cluster3_cols].sum(axis=1)
-thr3 = df_feat["cluster3_sum"].median() + (df_feat["cluster3_sum"].std() if cluster3_std else 0)
-df_feat["flag_cluster3"] = (df_feat["cluster3_sum"] > thr3).astype(int)
+# --- Key Symptom Features (Using Pre-defined List) ---
+st.sidebar.info(f"Using pre-defined Key Symptom group ({len(FINAL_KEY_SYMPTOM_COLS)} symptoms)")
 
-# energy flag
-df_feat["flag_low_energy"] = (df_feat["average_energy"] < energy_thr).astype(int)
+# Ensure all listed columns exist in df_feat, handle missing ones gracefully
+actual_key_symptom_cols = [col for col in FINAL_KEY_SYMPTOM_COLS if col in df_feat.columns]
+missing_key_cols = set(FINAL_KEY_SYMPTOM_COLS) - set(actual_key_symptom_cols)
+if missing_key_cols:
+    st.warning(f"Note: The following Key Symptoms were not found in the current data: {missing_key_cols}")
+
+if actual_key_symptom_cols: # Calculate sum only if some columns are present
+    df_feat["key_symptom_sum"] = df_feat[actual_key_symptom_cols].sum(axis=1)
+    # Use threshold logic (median + optional std controlled by checkbox)
+    key_sum_series = df_feat["key_symptom_sum"]
+    thr_key = key_sum_series.median() + (key_sum_series.std() if key_symptom_use_std else 0)
+    df_feat["flag_key_symptoms"] = (key_sum_series > thr_key).astype(int)
+else: # If no key symptom columns found in data, set sum/flag to 0
+     df_feat["key_symptom_sum"] = 0
+     df_feat["flag_key_symptoms"] = 0
+# --- End Key Symptom Features ---
+
+
+# --- Nutrition Features (Adapted from previous version) ---
+df_feat[['daily_calories','evening_num_items']] = 0 # Initialize only these
+
+if 'Nutrition' in df_raw_unprocessed['category'].unique():
+    df_raw_unprocessed['date'] = pd.to_datetime(df_raw_unprocessed['date formatted'], errors='coerce').dt.date
+    nut = df_raw_unprocessed[df_raw_unprocessed['category'] == 'Nutrition'].copy()
+
+    if not nut.empty:
+        nut['nutrition_amount'] = nut['detail'].apply(parse_amount)
+        nut['nutrition_num_items'] = nut['detail'].apply(count_meals)
+        nut['calories'] = nut['detail'].apply(estimate_cal)
+
+        if isinstance(df_feat.index, pd.DatetimeIndex):
+            df_feat_index_date = df_feat.index.date
+        else:
+            df_feat_index_date = df_feat.index
+
+        agg = nut.groupby('date')[['nutrition_amount','nutrition_num_items']].agg(
+            nutrition_amount=('nutrition_amount', 'max'),
+            nutrition_num_items=('nutrition_num_items', 'sum')
+        ).reindex(df_feat_index_date)
+
+        df_feat = df_feat.join(agg, how='left')
+
+        daily_cal = nut.groupby('date')['calories'].sum().reindex(df_feat_index_date, fill_value=0)
+        df_feat['daily_calories'] = daily_cal
+
+        pm = nut[nut['time of day']=='pm'].copy()
+        pm['pm_items'] = pm['detail'].apply(count_meals)
+        evening_items = pm.groupby(pm['date'])['pm_items'].sum().reindex(df_feat_index_date, fill_value=0)
+        df_feat['evening_num_items'] = evening_items
+
+        nut_cols_to_fill = ['nutrition_amount', 'nutrition_num_items', 'daily_calories', 'evening_num_items']
+        for col in nut_cols_to_fill:
+            if col in df_feat.columns: df_feat[col] = df_feat[col].fillna(0)
+
+        median_cal = df_feat['daily_calories'].median()
+        if pd.notna(median_cal) and median_cal > 0:
+            df_feat['flag_low_cal'] = (df_feat['daily_calories'] < median_cal).astype(int)
+        else: df_feat['flag_low_cal'] = 0
+
+        df_feat['flag_few_items'] = (df_feat['nutrition_num_items'] < 3).astype(int)
+        df_feat['flag_no_pm_snack'] = (df_feat['evening_num_items'] == 0).astype(int)
+
+    else:
+      # Ensure flags/cols exist even if no nutrition data
+      df_feat[['nutrition_amount', 'nutrition_num_items', 'flag_low_cal', 'flag_few_items', 'flag_no_pm_snack']] = 0
+else:
+    # Ensure flags/cols exist even if category is missing
+    df_feat[['nutrition_amount', 'nutrition_num_items', 'flag_low_cal', 'flag_few_items', 'flag_no_pm_snack']] = 0
 
 # ───────────────────────────────────────────────
 # 5. Today’s alerts
 # ───────────────────────────────────────────────
-today = pd.to_datetime(date.today())
-st.subheader(f"🚨 Alerts for {today.date()}")
+today_dt = pd.to_datetime(date.today())
+st.subheader(f"🚨 Alerts for {today_dt.date()}")
 
-if today in df_feat.index:
-    # switch from 3 to 4 columns
-    colA, colB, colC, colD = st.columns(4)
+alerts = [
+    ("🔋 Low Energy",      'flag_low_energy', "Energy below threshold."),
+    ("💤 Short Sleep (t-2)",'flag_sleep_predict', f"Slept < {sleep_thr:.1f}h 2 days ago."),
+    ("📈 Sleep Var ↑",      'flag_sleep_var', f"High sleep duration variability (> {var_thr:.1f}h SD over 7d)."),
+    ("⚠️ Key Symptoms ↑",  'flag_key_symptoms', "High score on key mood-related symptoms."), # Renamed Alert
+    ("⛽ Low Fuel",        'flag_low_cal', "Calories below your median."),
+    ("🥄 Few Items",       'flag_few_items', "< 3 distinct food items logged."),
+    ("🌙 No PM Snack",     'flag_no_pm_snack', "No food items logged in the evening.")
+]
 
-    with colA:
-        st.metric(
-            "🔋 Low Energy < threshold",
-            bool(df_feat.loc[today, "flag_low_energy"])
-        )
-
-    with colB:
-        st.metric(
-            "💤 Sleep < threshold (t−2)",
-            bool(df_feat.loc[today, "flag_sleep_predict"])
-        )
-
-    with colC:
-        st.metric(
-            "📈 Sleep variability ↑",
-            bool(df_feat.loc[today, "flag_sleep_var"])
-        )
-
-    with colD:
-        st.metric(
-            "⚠️ Cluster 3 spike",
-            bool(df_feat.loc[today, "flag_cluster3"])
-        )
-
-else:
-    st.info("No data for today in this export.")
-
+if today_dt in df_feat.index:
+    available_alerts = [(label, flag, desc) for label, flag, desc in alerts if flag in df_feat.columns]
+    if available_alerts:
+        cols = st.columns(len(available_alerts))
+        today_data = df_feat.loc[today_dt]
+        for i, (label, flag, desc) in enumerate(available_alerts):
+             with cols[i]:
+                is_triggered = bool(today_data[flag])
+                st.metric(
+                    label,
+                    "ALERT" if is_triggered else "OK",
+                    delta="Triggered" if is_triggered else None,
+                    delta_color="inverse" if is_triggered else "off",
+                    help=desc
+                )
+    else: st.info("No alert flags calculable for today.")
+else: st.info(f"No data available for {today_dt.date()} in this export.")
 
 # ───────────────────────────────────────────────
 # 6. Charts
@@ -262,122 +370,145 @@ c1, c2, c3 = st.columns(3)
 
 with c1:
     st.caption("Energy ➜ Mood (same day)")
-    fig1, ax1 = plt.subplots()
-    sns.regplot(
-        x="average_energy",
-        y="average_mood",
-        data=df_feat,
-        ax=ax1,
-        scatter_kws={"s": 30},
-        ci=None,
-    )
-    st.pyplot(fig1)
+    if 'average_energy' in df_feat.columns and 'average_mood' in df_feat.columns:
+        plot_data = df_feat[['average_energy', 'average_mood']].dropna()
+        if not plot_data.empty:
+            fig1, ax1 = plt.subplots()
+            sns.regplot(x="average_energy", y="average_mood", data=plot_data, ax=ax1,
+                        scatter_kws={"s": 30, "alpha": 0.6}, line_kws={"color": "red"}, ci=None)
+            ax1.set_title("Energy vs Mood")
+            st.pyplot(fig1)
+        else: st.info("Not enough data for Energy vs Mood plot.")
+    else: st.info("Energy or Mood data missing for plot.")
 
 with c2:
-    st.caption("Sleep < thr ➜ Mood (t+2)")
-    df_p = df_feat.dropna(subset=["sleep_duration_hours", "average_mood"])
-    df_p["sleep_flag"] = np.where(df_p["sleep_duration_hours"] < sleep_thr, "<thr", "≥thr")
-    fig2, ax2 = plt.subplots()
-    sns.boxplot(
-        x="sleep_flag", y=df_p["average_mood"].shift(-2), data=df_p, ax=ax2
-    )
-    ax2.set_ylabel("Mood two days later")
-    st.pyplot(fig2)
+    st.caption(f"Sleep < {sleep_thr:.1f}h ➜ Mood (t+2)")
+    if 'sleep_duration_hours' in df_feat.columns and 'average_mood' in df_feat.columns:
+        df_p = df_feat.dropna(subset=["sleep_duration_hours", "average_mood"]).copy()
+        if not df_p.empty:
+            df_p["sleep_flag"] = np.where(df_p["sleep_duration_hours"] < sleep_thr, f"<{sleep_thr:.0f}h", f"≥{sleep_thr:.0f}h")
+            df_p["mood_t2"] = df_p["average_mood"].shift(-2)
+            df_p = df_p.dropna(subset=["mood_t2"])
+            if not df_p.empty:
+                fig2, ax2 = plt.subplots()
+                sns.boxplot(x="sleep_flag", y="mood_t2", data=df_p, ax=ax2, order=[f"<{sleep_thr:.0f}h", f"≥{sleep_thr:.0f}h"])
+                ax2.set_ylabel("Mood two days later")
+                ax2.set_xlabel("Sleep Duration (t)")
+                ax2.set_title("Sleep vs Mood (t+2)")
+                st.pyplot(fig2)
+            else: st.info("Not enough data for Sleep vs Mood (t+2) plot after shifting.")
+        else: st.info("Not enough data for Sleep vs Mood plot.")
+    else: st.info("Sleep or Mood data missing for plot.")
 
 with c3:
-    st.caption("Cluster 3 sum over time")
-    st.line_chart(df_feat["cluster3_sum"])
-
+    # Renamed Chart
+    st.caption("Key Symptom Score Over Time")
+    if 'key_symptom_sum' in df_feat.columns and df_feat['key_symptom_sum'].notna().any():
+        st.line_chart(df_feat["key_symptom_sum"])
+    else:
+        st.info("Key Symptom score data not available.")
 
 # ───────────────────────────────────────────────
 # 7. Timeline
 # ───────────────────────────────────────────────
-# 1. Define your flag colors
+st.subheader("Flag Timeline")
+
 flag_colors = {
     "flag_low_energy": "#f94144",     # red
     "flag_sleep_predict": "#f9c74f",  # yellow
     "flag_sleep_var": "#277da1",      # blue
-    "flag_cluster3": "#9c89b8",       # purple
+    "flag_key_symptoms": "#9c89b8",   # purple (kept same color) - Renamed Flag
+    "flag_low_cal": "#90be6d",        # green
+    "flag_few_items": "#43aa8b",      # teal
+    "flag_no_pm_snack": "#577590"     # slate
 }
 
-# 2. Melt your flags into “long” form
-flags_long = (
-    df_feat[["flag_low_energy","flag_sleep_predict","flag_sleep_var","flag_cluster3"]]
-    .reset_index()  # brings the date index into a column named “date”
-    .melt(id_vars="date", var_name="flag", value_name="value")
-)
+flags_to_plot = [flag for flag in flag_colors if flag in df_feat.columns]
 
-# 3. Build an interactive Altair bar chart
-chart = (
-    alt.Chart(flags_long)
-    .mark_bar()
-    .encode(
-        x=alt.X("date:T", title="Date"),
-        y=alt.Y("value:Q", title="Flag On?"),
-        color=alt.Color(
-            "flag:N",
-            scale=alt.Scale(
-                domain=list(flag_colors.keys()),
-                range=list(flag_colors.values())
-            ),
-            legend=alt.Legend(title="Flag Type")
-        ),
-        tooltip=["date:T", "flag:N", "value:Q"]
+if flags_to_plot:
+    flags_long = (
+        df_feat[flags_to_plot]
+        .reset_index()
+        .melt(id_vars="date", var_name="flag", value_name="value")
     )
-    .interactive()  # pan & zoom
-)
+    flags_long = flags_long[flags_long["value"] > 0]
 
-# 4. Display in Streamlit
-st.subheader("Flag Timeline")
-st.altair_chart(chart, use_container_width=True)
+    if not flags_long.empty:
+        chart = (
+            alt.Chart(flags_long)
+            .mark_circle(size=80, opacity=0.7)
+            .encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("flag:N", title="Triggered Flag", axis=None),
+                color=alt.Color(
+                    "flag:N",
+                    scale=alt.Scale(domain=list(flag_colors.keys()), range=list(flag_colors.values())),
+                    legend=alt.Legend(title="Flag Type")
+                ),
+                 tooltip=[alt.Tooltip("date:T", title="Date"), alt.Tooltip("flag:N", title="Flag")]
+            )
+            .properties(title='Daily Triggered Alerts')
+            .interactive()
+        )
+        st.altair_chart(chart, use_container_width=True)
+    else: st.info("No flags were triggered in the selected data range for the timeline.")
+else: st.info("No flags available to display on the timeline.")
 
 # ───────────────────────────────────────────────
 # 8. Explainers
 # ───────────────────────────────────────────────
 
+# --- Alert Meanings ---
 with st.expander("❓ What do the alerts mean?", expanded=False):
-    cols = st.columns(4)
-    expls = [
-        ("🔴 🔋 Low Energy", "You're running low today.\nEnergy below your threshold → fatigue, distraction, low mood."),
-        ("🟡 💤 Short Sleep (t−2)", "Slept <6 h two days ago → watch for irritability or low motivation."),
-        ("🔵 📈 Sleep Variability", "Big swings in sleep over the past week → focus crashes, mood instability."),
-        ("🟣 ⚠️ Cluster 3", "ADHD/depression symptoms spiking → expect overwhelm and dysregulation.")
-    ]
-    for col, (title, text) in zip(cols, expls):
-        with col:
-            st.markdown(f"**{title}**")
-            st.write(text)
+    num_alerts = len(alerts)
+    # Adjust columns based on number of alerts, maybe max 4-5 per row?
+    cols = st.columns(min(num_alerts, 4)) # Example: Max 4 columns per row
+    col_idx = 0
+    for i, (label, flag, desc) in enumerate(alerts):
+        with cols[col_idx]:
+            st.markdown(f"**{label}**")
+            st.write(desc)
+        col_idx = (col_idx + 1) % len(cols)
 
 
-
-with st.expander("🧠 What is Cluster 3? (ADHD / Depression Symptom Group)", expanded=False):
+# --- Key Symptom Group Explainer (Replaces Cluster 3 Explainer) ---
+with st.expander("🧠 Understanding the Key Symptom Group", expanded=False):
     st.markdown("""
-Cluster 3 includes symptoms that most strongly correlate with **same-day mood drops**.
-They reflect patterns often tied to **executive dysfunction**, **mental restlessness**, and **emotional reactivity**.
+This group includes symptoms identified through analysis of historical data (60 days) as being **most strongly correlated with lower mood and potential executive dysfunction episodes** on the same day.
+
+Tracking the combined score of these specific symptoms provides a focused signal for days likely requiring more self-care or adjusted expectations.
 """)
-
-    # Dynamically split the list into two columns
-    col1, col2 = st.columns(2)
-    half = len(cluster3_cols) // 2 + len(cluster3_cols) % 2
-    col1_list = cluster3_cols[:half]
-    col2_list = cluster3_cols[half:]
-
-    with col1:
-        for symptom in col1_list:
-            st.markdown(f"- {symptom}")
-
-    with col2:
-        for symptom in col2_list:
-            st.markdown(f"- {symptom}")
+    if FINAL_KEY_SYMPTOM_COLS: # Check if list is defined
+        st.markdown("**Symptoms currently in this group:**")
+        # Display the fixed list
+        col1, col2 = st.columns(2)
+        half = len(FINAL_KEY_SYMPTOM_COLS) // 2 + len(FINAL_KEY_SYMPTOM_COLS) % 2
+        with col1:
+            for symptom in FINAL_KEY_SYMPTOM_COLS[:half]:
+                st.markdown(f"- {symptom}")
+        with col2:
+            if len(FINAL_KEY_SYMPTOM_COLS) > half: # Avoid error if only 1 item
+                 for symptom in FINAL_KEY_SYMPTOM_COLS[half:]:
+                    st.markdown(f"- {symptom}")
+    else:
+        st.info("The Key Symptom list is not defined.")
 
 
 # ───────────────────────────────────────────────
 # 9. Download processed data
 # ───────────────────────────────────────────────
-st.markdown("### Download processed CSV")
-csv_bytes = df_feat.to_csv(index=True).encode()
+st.markdown("---")
+st.markdown("### Download Processed Data")
+csv_bytes = df_feat.to_csv(index=True).encode('utf-8')
 st.download_button(
-    "📥 Download",
+    label="📥 Download Processed CSV",
     data=csv_bytes,
     file_name=f"bearable_processed_{pd.Timestamp.now():%Y%m%d_%H%M%S}.csv",
+    mime='text/csv',
+    key='download_button'
 )
+
+with st.expander("Show Processed Dataframe"):
+    st.dataframe(df_feat)
+
+# --- End of Script ---
