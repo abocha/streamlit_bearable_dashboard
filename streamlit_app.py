@@ -416,12 +416,45 @@ with c2:
         else: st.info("Not enough data for Sleep vs Mood plot.")
     else: st.info("Sleep or Mood data missing for plot.")
 
+# (Corrected code for Section 6, column c3)
 with c3:
-    st.caption("Key Symptom Score Over Time")
+    st.caption("Key Symptom Score Over Time (with Trend)")
     if 'key_symptom_sum' in df_feat.columns and df_feat['key_symptom_sum'].notna().any():
-        st.line_chart(df_feat["key_symptom_sum"])
+        chart_data = df_feat[['key_symptom_sum']].reset_index().dropna()
+
+        if not chart_data.empty:
+            base = alt.Chart(chart_data).encode(
+                x=alt.X('date:T', title='Date')
+            )
+
+            raw_line = base.mark_line(point=True, opacity=0.7, color='lightblue').encode(
+                y=alt.Y('key_symptom_sum:Q', title='Key Symptom Score'), # Title defined here
+                tooltip=[
+                    alt.Tooltip('date:T', title='Date'),
+                    alt.Tooltip('key_symptom_sum:Q', title='Score', format='.1f')
+                ]
+            )
+
+            trend_line = base.transform_loess(
+                'date',
+                'key_symptom_sum',
+                bandwidth=0.3
+            ).mark_line(color='red', strokeDash=[5,5], size=2).encode(
+                # *** ADD THIS Y-ENCODING FOR THE TRANSFORMED DATA ***
+                # Use the same column name as input; LOESS output retains it.
+                # No need to repeat the title as it's shared with raw_line.
+                y=alt.Y('key_symptom_sum:Q')
+            )
+
+            combined_chart = alt.layer(raw_line, trend_line).properties(
+                title='Daily Key Symptom Score and LOESS Trend'
+            ).interactive()
+
+            st.altair_chart(combined_chart, use_container_width=True)
+        else:
+            st.info("Not enough valid data points to plot Key Symptom score trend.")
     else:
-        st.info("Key Symptom score data not available.")
+        st.info("Key Symptom score data not available for plotting.")
 
 # ───────────────────────────────────────────────
 # 7. Timeline
