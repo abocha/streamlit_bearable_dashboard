@@ -211,8 +211,8 @@ df_feat['sleep_std_7d'] = (
 )
 
 # ── Nutrition features & flags ────────────────────────────────────
-nut_source = latest_file if latest_file is not None else uploaded
-raw_nut = pd.read_csv(nut_source)
+# Use the same `latest_file` you loaded above for raw data
+raw_nut = pd.read_csv(latest_file)
 raw_nut['date'] = pd.to_datetime(raw_nut['date formatted'], errors='coerce').dt.date
 
 nut_df = raw_nut[raw_nut['category']=='Nutrition'].copy()
@@ -245,6 +245,7 @@ median_cal = df_feat['daily_calories'].median()
 df_feat['flag_low_cal']     = (df_feat['daily_calories'] < median_cal).astype(int)
 df_feat['flag_few_items']   = (df_feat['nutrition_num_items'] < 3).astype(int)
 df_feat['flag_no_pm_snack'] = (df_feat['evening_num_items'] == 0).astype(int)
+
 
 # Sidebar slider for variability threshold
 var_thr = st.sidebar.slider(
