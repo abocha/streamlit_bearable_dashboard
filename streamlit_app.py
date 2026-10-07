@@ -1,4 +1,6 @@
 # streamlit_app.py
+import os
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -182,9 +184,9 @@ def add_features(df: pd.DataFrame, sleep_thr: float) -> pd.DataFrame:
 # ───────────────────────────────────────────────
 # 2. Sidebar controls
 # ───────────────────────────────────────────────
-st.sidebar.header("⚙️ Alert Thresholds")
+st.sidebar.header("⚙️ Heuristic Flag Thresholds")
 energy_thr = st.sidebar.slider("Energy < threshold triggers flag", 1.0, 5.0, 3.0, 0.5, key="energy_thr_slider")
-sleep_thr = st.sidebar.slider("Sleep hours threshold (<) for t+2 mood dip", 4.0, 8.0, 6.0, 0.5, key="sleep_thr_slider")
+sleep_thr = st.sidebar.slider("Sleep hours threshold (<) for lagged t+2 comparison", 4.0, 8.0, 6.0, 0.5, key="sleep_thr_slider")
 var_thr = st.sidebar.slider(
     "Sleep variability flag (7‑day SD > … hours)", 0.0, 3.0, 1.0, 0.1, key="var_thr_slider"
 )
@@ -195,10 +197,11 @@ key_symptom_use_std = st.sidebar.checkbox(
 # ───────────────────────────────────────────────
 # 3. Load CSV (Read Once Logic)
 # ───────────────────────────────────────────────
-st.title("🐰 Bearable Mood & Symptom Dashboard")
-st.markdown("Focusing on mood, energy, sleep, nutrition, and key symptom patterns.")
+st.title("🐰 Exploratory Bearable Data Dashboard")
+st.markdown("Explore mood, energy, sleep, nutrition, and symptom patterns from a Bearable CSV export. Flags are user-defined heuristics, not medical predictions.")
 
-EXPORT_DIR = Path("G:/Мой диск/Bearable_export") # Adjust if your path is different
+export_dir_value = os.environ.get("BEARABLE_EXPORT_DIR")
+EXPORT_DIR = Path(export_dir_value).expanduser() if export_dir_value else None
 pattern = re.compile(
     r"Bearable App - Data Export\. Generated (\d{2}-\d{2}-\d{4})\.csv"
 )
@@ -206,7 +209,7 @@ latest_file = None
 source_info = None
 source_object = None
 
-if EXPORT_DIR.exists() and EXPORT_DIR.is_dir():
+if EXPORT_DIR and EXPORT_DIR.exists() and EXPORT_DIR.is_dir():
     matches = []
     for file in EXPORT_DIR.glob("*.csv"):
         m = pattern.match(file.name)
@@ -223,7 +226,10 @@ if EXPORT_DIR.exists() and EXPORT_DIR.is_dir():
 if latest_file:
     st.success(f"Auto‑loaded: {source_info}")
 else:
-    st.sidebar.info("Auto-load failed or no files found.")
+    if EXPORT_DIR:
+        st.sidebar.info("No matching export found in BEARABLE_EXPORT_DIR. Upload a CSV manually instead.")
+    else:
+        st.sidebar.info("Set BEARABLE_EXPORT_DIR for optional auto-load, or upload a CSV manually.")
     uploaded_file = st.sidebar.file_uploader("Upload Bearable CSV", type="csv", key="manual_upload")
     if uploaded_file:
         source_info = uploaded_file.name
@@ -321,37 +327,37 @@ else: df_feat[['nutrition_amount', 'nutrition_num_items', 'flag_low_cal', 'flag_
 # 5. Today’s alerts
 # ───────────────────────────────────────────────
 today_dt = pd.to_datetime(date.today())
-st.subheader(f"🚨 Today's Actionable Insights & Alerts ({today_dt.date()})") # Renamed subheader
+st.subheader(f"🚩 Today's Heuristic Flags ({today_dt.date()})")
 
 # Define alerts with ENHANCED descriptions
 alerts = [
     (
         "🔋 Low Energy", 'flag_low_energy',
-        f"Energy < {energy_thr:.1f}. **Expect lower focus & motivation. Prioritize rest & reduce demands today.**"
+        f"Energy < {energy_thr:.1f}. A user-defined marker for reviewing same-day context; it is not a prediction."
     ),
     (
         "💤 Short Sleep (t-2)", 'flag_sleep_predict',
-        f"Slept < {sleep_thr:.1f}h 2 days ago. **Watch for delayed effects: irritability, lower resilience, or executive function dips today.**"
+        f"Slept < {sleep_thr:.1f}h two days earlier. Marks days for lagged comparison with later observations; no causal claim is implied."
     ),
     (
         "📈 Sleep Var ↑", 'flag_sleep_var',
-        f"High sleep variability (> {var_thr:.1f}h SD over 7d). **Indicates instability; energy/focus may be unpredictable. Aim for consistent sleep timing.**"
+        f"7-day sleep-duration SD > {var_thr:.1f}h. Highlights unusually variable sleep for exploratory review."
     ),
     (
         "⚠️ Key Symptoms ↑", 'flag_key_symptoms',
-        "High score on key mood-related symptoms. **Signifies potential executive dysfunction or mood dip. Expect overwhelm; simplify tasks.**"
+        "Combined key-symptom score is above its historical threshold in this dataset. Treat it as an unusual-pattern marker."
     ),
     (
-        "⛽ Low Fuel", 'flag_low_cal',
-        "Calories below your median. **Risk of energy crash or brain fog later. Ensure adequate fueling today.**"
+        "⛽ Low Logged Fuel", 'flag_low_cal',
+        "Estimated logged calories are below this dataset's median. Estimates are coarse and depend on a small food lookup table."
     ),
     (
-        "🥄 Few Items", 'flag_few_items',
-        "< 3 distinct food items logged. **May indicate low intake or variety? Check if you ate enough; also reflects logging effort.**"
+        "🥄 Few Logged Items", 'flag_few_items',
+        "< 3 distinct food items logged. This may reflect intake, variety, or simply incomplete logging."
     ),
     (
-        "🌙 No PM Snack", 'flag_no_pm_snack',
-        "No food items logged in the evening. **Risk of overnight blood sugar dip? Consider if a pre-bed snack helps stabilise morning energy/mood.**"
+        "🌙 No PM Food Logged", 'flag_no_pm_snack',
+        "No food items were logged in the evening. Treat this as a context/logging marker, not a health recommendation."
     )
 ]
 
@@ -508,7 +514,7 @@ else: st.info("No flags available to display on the timeline.")
 st.markdown("---") # Separator before explainers
 
 # --- Alert Meanings Expander ---
-with st.expander("❓ Alert Meanings & Actionable Insights", expanded=True): # Expand by default
+with st.expander("❓ Flag Meanings & Caveats", expanded=True):
     num_alerts_available = sum(1 for _, flag, _ in alerts if flag in df_feat.columns) # Count only available flags
     if num_alerts_available > 0:
         cols = st.columns(min(num_alerts_available, 3)) # Max 3 columns per row
@@ -528,9 +534,9 @@ with st.expander("❓ Alert Meanings & Actionable Insights", expanded=True): # E
 # --- Key Symptom Group Explainer ---
 with st.expander("🧠 Understanding the Key Symptom Group", expanded=False):
     st.markdown("""
-This group includes symptoms identified through analysis of historical data (60 days) as being **most strongly correlated with lower mood and potential executive dysfunction episodes** on the same day.
+This group contains symptoms selected from an earlier exploratory analysis of roughly 60 days of historical data. In that dataset, they showed relatively strong same-day association with lower mood and related self-reported difficulties.
 
-Tracking the combined score of these specific symptoms provides a focused signal for days likely requiring more self-care or adjusted expectations.
+The combined score is useful as a compact pattern marker for further inspection. It does **not** establish causality, diagnose a condition, or predict what will happen on a given day.
 """)
     if FINAL_KEY_SYMPTOM_COLS:
         st.markdown("**Symptoms currently in this group:**")
