@@ -1,89 +1,153 @@
-# 📊 Bearable Mood Tracker – Streamlit Dashboard
+# Exploratory Bearable Data Dashboard
 
-This Streamlit app visualizes mood, energy, sleep, and symptom data exported from the **Bearable app**, with a focus on detecting early warning signs of low mood and executive dysfunction.
+A small Streamlit data project for exploring CSV exports from the [Bearable](https://bearable.app/) tracking app.
 
----
+The dashboard turns event-style exports into daily features, adds a set of configurable heuristic flags, and visualizes relationships among mood, energy, sleep, symptoms, and logged nutrition.
 
-## ✅ Features
+This is an **exploratory personal-analytics tool**, not a medical prediction or diagnostic system. The flags are thresholds for finding days worth inspecting, not validated health alerts.
 
-- 📅 **Daily Alerts** for:
-  - Low energy
-  - Sleep < 6h (lagged 2 days)
-  - High sleep variability (7-day std)
-  - Cluster 3 symptom spikes
+## What it does
 
-- 🧠 **Flag Timeline** chart with color-coded, interactive indicators
-- 🔎 **Cluster 3 Explainer**: Executive function, restlessness, mood lability
-- ⚙️ **Sidebar Controls** to adjust thresholds (energy, sleep, variability)
-- 📦 **Automatic loading** of latest Bearable export from a synced Google Drive folder
+- parses Bearable CSV exports into a daily time series;
+- normalizes mood, energy, sleep, and symptom records;
+- derives rolling and lagged features such as 7-day sleep variability;
+- builds a combined score from a selected symptom group;
+- adds configurable threshold flags for exploratory review;
+- visualizes same-day and lagged relationships;
+- shows a timeline of triggered flags;
+- exports the processed daily dataset as CSV.
 
----
+## Data flow
 
-## 🚀 How to Use
+```text
+Bearable CSV export
+        |
+        v
+clean + normalize
+        |
+        v
+daily feature table
+  |     |      |
+  |     |      +--> symptom aggregation
+  |     +---------> rolling sleep statistics
+  +---------------> mood / energy / nutrition features
+        |
+        v
+heuristic flags + exploratory charts
+        |
+        +--> Streamlit dashboard
+        +--> processed CSV download
+```
 
-1. **Set up Google Drive sync**:
-   - Your Bearable app exports should save to:
-     ```
-     G:/Мой диск/Bearable_export/
-     ```
-     (or whatever your synced Google Drive path is)
+## Input
 
-2. **Run the app** from your terminal:
-   ```bash
-   streamlit run streamlit_app.py
-   ```
+The app expects a Bearable CSV export containing the fields used by the parser, including `date formatted`, `rating/amount`, `category`, and `detail`.
 
-3. **The app will automatically**:
-   - Load the most recent CSV export
-   - Clean and parse it using your `load_and_clean()` function
-   - Generate daily insights and display timelines
+There are two ways to provide a file.
 
----
+### Manual upload
 
-## 🔧 Configurable Flags
+This is the portable default. Run the app and upload a Bearable CSV from the sidebar.
 
-You can customize detection thresholds via the **sidebar sliders**:
+### Optional auto-load directory
 
-- **Energy threshold** (default = 3.0)
-- **Sleep duration threshold** (default = 6.0h, t−2)
-- **Sleep variability threshold** (default = 1.0h std over 7d)
+Set `BEARABLE_EXPORT_DIR` to a folder containing Bearable exports:
 
----
+```powershell
+$env:BEARABLE_EXPORT_DIR = "C:\path\to\Bearable_export"
+streamlit run streamlit_app.py
+```
 
-## 🔁 How to Adapt the App Later
+When configured, the app looks for files named like:
 
-### 1. Add New Flags
-- Define a new flag in the `add_features()` step
-- Add it to:
-  - The **alerts block** (`st.metric(...)`)
-  - The **timeline chart**
-  - The **explainers section**
+```text
+Bearable App - Data Export. Generated DD-MM-YYYY.csv
+```
 
-### 2. Update Symptom Clustering
-- Re-run clustering in Jupyter with more data
-- Update `cluster3_cols` in the app with the new symptom list
+and auto-loads the newest matching export. If the directory is missing or no file matches, manual upload remains available.
 
-### 3. Use External Uploads Instead of Drive (optional)
-- Replace the Google Drive path with:
-  ```python
-  uploaded_file = st.file_uploader("Upload your Bearable export")
-  ```
-  for manual CSV uploads
+No personal filesystem path is required by the repository.
 
----
+## Features
 
-## 💡 Tips
+### Daily feature engineering
 
-- Keep your `scrub.py` / `load_and_clean()` up to date with any changes in Bearable's export format
-- Revisit your EDA every ~30 days to refine thresholds, validate hypotheses, or discover new patterns
+The parser derives or aggregates:
 
----
+- average mood;
+- average energy;
+- sleep duration and bedtime;
+- sleep quality;
+- symptom severity columns;
+- total symptom score;
+- 7-day mood average and delta;
+- 7-day sleep-duration standard deviation;
+- simple nutrition/logging features.
 
-## 🧠 Background
+### Heuristic flags
 
-This app is part of a self-tracking system for a user with **ADHD**, designed to surface meaningful patterns and give early warnings for:
-- Mood dips
-- Executive dysfunction episodes
-- Sleep-related instability
+Sidebar controls let you change thresholds for:
 
-All flags are derived from exploratory data analysis and refined over time based on empirical signal and lived experience.
+- low reported energy;
+- short sleep two days earlier;
+- high 7-day sleep variability;
+- unusually high combined key-symptom score;
+- low estimated logged calories relative to the dataset median;
+- few logged food items;
+- no evening food logged.
+
+These are intentionally labelled **heuristics**. They help select observations for review; they do not demonstrate a causal relationship or prescribe an action.
+
+### Visualizations
+
+The dashboard includes:
+
+- energy vs. mood regression view;
+- short-sleep vs. mood two days later comparison;
+- key-symptom score over time with a LOESS trend;
+- an interactive flag timeline;
+- the processed dataframe and CSV download.
+
+## Methodological caveats
+
+This repository grew out of exploratory analysis, so its constraints are part of the project:
+
+- thresholds are hand-selected and configurable, not clinically validated;
+- lagged comparisons are observational and should not be read as causal;
+- the selected symptom group came from a limited historical window;
+- nutrition values use a small hard-coded lookup table and are coarse estimates;
+- missing or inconsistent logging can look like a behavioral signal;
+- correlations discovered in one personal dataset may not generalize.
+
+A stronger next iteration would separate reusable parsing/features from the Streamlit UI and add tests around Bearable-format changes.
+
+## Run locally
+
+Requirements: Python 3.10+.
+
+```bash
+python -m venv .venv
+```
+
+Activate the environment, then:
+
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+The app opens locally and prompts for a CSV unless `BEARABLE_EXPORT_DIR` points to a matching export directory.
+
+## Stack
+
+- Streamlit
+- pandas / NumPy
+- Matplotlib + seaborn
+- Altair
+- SciPy
+
+## Project status
+
+This is a compact exploratory-analysis prototype, not a production health application.
+
+Its main portfolio value is the data path: converting a messy event export into a daily analytical table, making assumptions visible as feature/threshold code, and presenting lagged and rolling patterns interactively without requiring a backend.
